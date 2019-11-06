@@ -9,9 +9,15 @@ from scipy.spatial.distance import cdist
 from torch.autograd import Variable
 
 import cv2
+import pdb
+from PIL import Image
+from torchvision.transforms import Compose, Normalize, ToTensor
 from frcnn.model.nms_wrapper import nms
+from frcnn.model import test
 
 from .utils import bbox_overlaps, bbox_transform_inv, clip_boxes
+
+transforms = Compose([ToTensor(), Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
 COLORS_10 =[(144,238,144),(178, 34, 34),(221,160,221),(  0,255,  0),(  0,128,  0),(210,105, 30),(220, 20, 60),
             (192,192,192),(255,228,196),( 50,205, 50),(139,  0,139),(100,149,237),(138, 43,226),(238,130,238),
@@ -31,8 +37,9 @@ class Tracker():
 	# only track pedestrian
 	cl = 1
 
-	def __init__(self, obj_detect, reid_network, tracker_cfg):
+	def __init__(self, obj_detect, obj_detect_head ,reid_network, tracker_cfg):
 		self.obj_detect = obj_detect
+		self.obj_detect_head = obj_detect_head
 		self.reid_network = reid_network
 		self.detection_person_thresh = tracker_cfg['detection_person_thresh']
 		self.regression_person_thresh = tracker_cfg['regression_person_thresh']
@@ -317,7 +324,7 @@ class Tracker():
 		"""
 		self.image = blob['image']
 		# print(blob['image'].shape)
-		self.vdo_path = blob['im_path']
+		self.video_path = blob['im_path']
 		for t in self.tracks:
 			t.last_pos = t.pos.clone()
 
@@ -449,7 +456,7 @@ class Tracker():
 		return self.results
 
 	def draw_bboxes(self, img, bbox, identities=None, offset=(0, 0)):
-		imgs = []
+		objects = []
 		for i, box in enumerate(bbox):
 			x1, y1, x2, y2 = [int(i) for i in box]
 			x1 += offset[0]
@@ -462,13 +469,13 @@ class Tracker():
 			color = COLORS_10[id % len(COLORS_10)]
 			# label = '{} {}'.format("id-", id)
 			label = '{}'.format(id)
-			# img_crop = img[y1:y2, x1:x2]
-			# imgs.append(img_crop)
-			t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 2, 2)[0]
-			cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+			img_crop = img[y1:y2, x1:x2]
+			objects.append(img_crop)
+			t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1, 1)[0]
+			cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
 			cv2.rectangle(img, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), color, -1)
-			cv2.putText(img, label, (x1, y1 + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
-		return img
+			cv2.putText(img, label, (x1, y1 + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 1, [255, 255, 255], 1)
+		return img, objects
 
 	def show_tracks(self, area):
 
@@ -476,7 +483,6 @@ class Tracker():
 		# self.im_height = int(self.vdo.get(cv2.CAP_PROP_FRAME_HEIGHT))
 		# self.area = 0, 0, self.im_width, self.im_height
 		ori_im = self.image
-
 		xmin, ymin, xmax, ymax = area
 
 		# self.write_video = True
@@ -485,7 +491,6 @@ class Tracker():
 		# 	 cv2.VideoWriter("demo1.avi", fourcc, 20, (self.im_width, self.im_height))
 
 		bbox_output = []
-		# identities = []
 		for t in self.tracks:
 			t_id = int(t.id)
 			# bbox_xyxy = t.pos
@@ -497,22 +502,64 @@ class Tracker():
 			# threshold = 30
 			# if (x2 - x1 > threshold or y2 - y1 > threshold):
 			bbox_output.append(np.array([x1, y1, x2, y2, t_id], dtype=np.int))
-		print("====bbox:", len(bbox_output))
+		# print("====bbox:", len(bbox_output))
 		if len(bbox_output) > 0:
 			bbox_output = np.stack(bbox_output, axis=0)
 			bbox_xyxy = bbox_output[:, :4]
 			identities = bbox_output[:, -1]
-			output_im = self.draw_bboxes(ori_im, bbox_xyxy, identities, offset=(xmin, ymin))
-
-		# for i in range(0, len(bbox_output)):
-		# 	print(identities[i])
-		# 	cv2.imshow("output", output_im[i])
-		# 	cv2.waitKey(500)
-		cv2.imshow("output", output_im)
+			ori_im, objects = self.draw_bboxes(ori_im, bbox_xyxy, identities, offset=(xmin, ymin))
+			head_im, heads = self.step_head(ori_im, objects, bbox_output)
+		
+		cv2.imshow("output", head_im)
 		cv2.waitKey(1)
 
+		return objects, identities
 		# if self.write_video:
-		# 	self.output.write(output_im)
+		# 	self.output.write(ori_im)
+
+	def step_head(self, ori_im, objects, bbox_output):
+
+		for i in range(0, len(objects)):
+			# input person objects to detect each head
+			blobs_head, im_scales = test._get_blobs(objects[i])
+			data = blobs_head['data']
+			head = {}
+			head['image'] = cv2.resize(objects[i], (0, 0), fx=im_scales, fy=im_scales, interpolation=cv2.INTER_NEAREST)
+			head['data'] = torch.from_numpy(data).unsqueeze(0)
+			im_info = np.array([data.shape[1], data.shape[2], im_scales[0]], dtype=np.float32)
+			head['im_info'] = torch.from_numpy(im_info).unsqueeze(0)
+			# convert to siamese input
+			objects_cv = cv2.cvtColor(objects[i], cv2.COLOR_BGR2RGB)
+			objects_cv = Image.fromarray(objects_cv)
+			objects_cv = transforms(objects_cv)
+			head['app_data'] = objects_cv.unsqueeze(0).unsqueeze(0)
+			###############################
+			# detect the head from object #
+			###############################
+			self.obj_detect_head.load_image(head['data'][0], head['im_info'][0])
+			_, scores, bbox_pred, rois = self.obj_detect_head.detect()
+			# filter the bbox by scores
+			boxes = bbox_transform_inv(rois, bbox_pred)
+			boxes = clip_boxes(Variable(boxes), head['im_info'][0][:2]).data
+			scores = scores[:, self.cl]
+			inds = torch.gt(scores, 0.1).nonzero().view(-1)
+			if inds.nelement() > 0:
+				boxes = boxes[inds]
+				boxes = boxes / im_scales[0]
+				det_pos = boxes[:, self.cl*4:(self.cl+1)*4]
+				det_pos = det_pos[0, :4].view(1, 4)  # remain only one bbox
+				object_pos = torch.from_numpy(bbox_output[i, :2]).repeat(1,2).float().cuda()
+				det_pos += object_pos
+				det_scores = scores[inds[0]]
+			else:
+				det_pos = torch.zeros(0).cuda()
+				det_scores = torch.zeros(0).cuda()
+			# print("======scores, pos:", det_scores, det_pos)
+			# head_im, heads = self.draw_bboxes(objects[i], det_pos)
+			i_id = [bbox_output[:, -1][i],]
+			head_im, heads = self.draw_bboxes(ori_im, det_pos, i_id)
+		
+		return head_im, heads
 
 
 class Track(object):
